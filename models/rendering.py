@@ -1,5 +1,6 @@
 import torch
 from einops import rearrange
+from torch.distributions.categorical import Categorical
 
 
 def sample_pdf(bins, weights, N_importance, det=False, eps=1e-5):
@@ -81,14 +82,21 @@ def inference(model,
     out_chunks = []
     B = xyz_flat.shape[0]
     for i in range(0, B, chunk):
-        xyz_emb = embedding_xyz(xyz_flat[i:i + chunk])
+        out = embedding_xyz(xyz_flat[i:i + chunk])
+        if isinstance(out, (tuple, list)):
+            xyz_emb, keep_mask = out
+        else:
+            xyz_emb, keep_mask = out, None
         if weights_only:
             inp = xyz_emb
         else:
             inp = torch.cat(
                 [xyz_emb, dir_embed_rep[i:i + chunk]], dim=1
             )
-        out_chunks.append(model(inp, sigma_only=weights_only))
+        out = model(inp, sigma_only=weights_only)
+        if keep_mask is not None:
+            out[~keep_mask, -1] = 0  # set sigma to 0 for invalid points
+        out_chunks.append(out)
     out = torch.cat(out_chunks, dim=0)
 
     if weights_only:
@@ -195,10 +203,23 @@ def render_rays(models,
         model_coarse, embeddings, pts_coarse, rays_d, z_vals,
         chunk, noise_std, white_back, weights_only=False
     )
+
+    # By minimizing entropy, the model is encouraged to place most of the
+    # probability mass on fewer samples.
+	# This enforces sparse occupancy: the network is pushed to make sharp,
+    # thin surfaces instead of smearing density everywhere along the ray.
+	# That’s why it’s called a sparsity loss: it penalizes diffuse distributions
+    # and promotes sparsity in ray termination.
+    sparsity_loss = Categorical(
+        probs=torch.cat([
+            weights_coarse, 1.0 - weights_coarse.sum(-1, keepdim=True) + 1e-6
+        ], dim=-1)
+    ).entropy()
     result = {
         'rgb_coarse': rgb_coarse,
         'depth_coarse': depth_coarse,
-        'opacity_coarse': weights_coarse.sum(dim=1)
+        'opacity_coarse': weights_coarse.sum(dim=1),
+        'coarse_sparsity_loss': sparsity_loss
     }
     if N_importance > 0:
         model_fine = models[1]
@@ -219,9 +240,15 @@ def render_rays(models,
             model_fine, embeddings, pts_fine, rays_d, z_vals,
             chunk, noise_std, white_back, weights_only=False
         )
+        sparsity_loss = Categorical(
+            probs=torch.cat([
+                weights_fine, 1.0 - weights_fine.sum(-1, keepdim=True) + 1e-6
+            ], dim=-1)
+        ).entropy()
         result.update({
             'rgb_fine': rgb_fine,
             'depth_fine': depth_fine,
-            'opacity_fine': weights_fine.sum(dim=1)
+            'opacity_fine': weights_fine.sum(dim=1),
+            'fine_sparsity_loss': sparsity_loss
         })
     return result

@@ -8,7 +8,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from torchvision.utils import save_image
 from collections import defaultdict
 
-from models import NeRF, Embedding, render_rays
+from models import NeRF, Embedding, HashEmbedder, render_rays
 from datasets import build_dataset
 from utils.metrics import psnr
 from utils.loss import MSELoss
@@ -21,17 +21,24 @@ seed_everything(42, workers=True)
 
 
 class NERFModule(LightningModule):
-    def __init__(self, cfg, log_dir):
+    def __init__(self, cfg, log_dir, bbox):
         super().__init__()
         self.cfg = cfg
-        self.embedding_xyz = Embedding(3, cfg.model.xyz_embed_dim)
+        self.embedding_xyz = HashEmbedder(
+            bounding_box=bbox,
+            n_levels=cfg.model.n_levels,
+            n_features_per_level=cfg.model.n_features_per_level,
+            log2_hashmap_size=cfg.model.log2_hashmap_size,
+            base_resolution=cfg.model.base_resolution,
+            finest_resolution=cfg.model.finest_resolution
+        )
         self.embedding_dir = Embedding(3, cfg.model.dir_embed_dim)
         self.embeddings = [self.embedding_xyz, self.embedding_dir]
 
         self.nerf_coarse = NeRF(
             depth=cfg.model.depth,
             width=cfg.model.width,
-            in_ch_xyz=3 + 3 * cfg.model.xyz_embed_dim * 2,
+            in_ch_xyz=cfg.model.n_levels * cfg.model.n_features_per_level,
             in_ch_dir=3 + 3 * cfg.model.dir_embed_dim * 2,
             skips=cfg.model.skips,
         )
@@ -40,7 +47,7 @@ class NERFModule(LightningModule):
             self.nerf_fine = NeRF(
                 depth=cfg.model.depth,
                 width=cfg.model.width,
-                in_ch_xyz=3 + 3 * cfg.model.xyz_embed_dim * 2,
+                in_ch_xyz=cfg.model.n_levels * cfg.model.n_features_per_level,
                 in_ch_dir=3 + 3 * cfg.model.dir_embed_dim * 2,
                 skips=cfg.model.skips,
             )
@@ -61,6 +68,7 @@ class NERFModule(LightningModule):
         parameters = []
         for model in self.models:
             parameters += list(model.parameters())
+        parameters += list(self.embedding_xyz.parameters())
         optimizer = torch.optim.Adam(
             parameters,
             lr=self.cfg.lr,
@@ -104,7 +112,7 @@ class NERFModule(LightningModule):
         rays, rgbs = self.decode_batch(batch)
         results = self.forward(rays)
 
-        log = {'train/loss': self.loss(results, rgbs)}
+        log = {'train/loss': self.loss(results, rgbs, sparsity_loss=True)}
         typ = 'fine' if 'rgb_fine' in results else 'coarse'
 
         with torch.no_grad():
@@ -127,7 +135,7 @@ class NERFModule(LightningModule):
         rgbs = rgbs.squeeze(0)
         results = self.forward(rays)
 
-        log = {'val_loss': self.loss(results, rgbs)}
+        log = {'val_loss': self.loss(results, rgbs, sparsity_loss=True)}
         typ = 'fine' if 'rgb_fine' in results else 'coarse'
 
         W, H = self.cfg.dataset.img_wh
@@ -147,7 +155,7 @@ class NERFModule(LightningModule):
         return log
 
 
-@hydra.main(config_path="conf", config_name="train", version_base="1.3")
+@hydra.main(config_path="conf", config_name="train_ngp", version_base="1.3")
 def run(cfg: DictConfig):
     # instead of print(cfg)
     print(OmegaConf.to_yaml(cfg, resolve=True, sort_keys=False))
@@ -184,7 +192,8 @@ def run(cfg: DictConfig):
         callbacks=callbacks
     )
 
-    module = NERFModule(cfg, log_dir=run_root)
+    bbox = train_loader.dataset.bbox
+    module = NERFModule(cfg, log_dir=run_root, bbox=bbox)
     trainer.fit(module, train_loader, val_loader)
 
 
